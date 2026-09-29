@@ -18,6 +18,8 @@ The acceptance check confirmed that this `cfn-lint` version does not reject `S3F
 
 The network stack is deployed before the data stack. The one-shot task receives a public IP in a public subnet so it can pull the public MySQL image and RDS CA bundle; it has no inbound rules. App task ingress is limited to the ALB security group, ALB ingress is limited to the CloudFront origin-facing prefix list, and the database uses private subnets.
 
+The container health check probes `http://127.0.0.1:8080/openboxes/health` with a 10-second timeout and five retries; the investigator can read the RDS `error` and `slowquery` logs.
+
 For a diagnostic data- or app-stack deployment that preserves resources if creation fails, opt in with `DISABLE_ROLLBACK=1`. The default deploy behavior is unchanged; use this only when you need to inspect and manually recover a failed deployment.
 
 The initialization task is safe to repeat. It creates the `openboxes` schema using `utf8`/`utf8_general_ci`, creates the SSL-required application user with only the schema grants needed by OpenBoxes, and prints connection/schema verification results without printing passwords.
