@@ -1,6 +1,6 @@
 # OpenBoxes AWS demo: network and data
 
-This stack pair provides a synthetic, temporary OpenBoxes demo VPC, private MySQL 8.4.11 RDS instance, application database secret, versioned uploads bucket and S3 Files file system, ECR repository, ECS cluster, one-shot database initialization task, and monthly budget. This is a synthetic demo environment, not a bank-approved deployment.
+These stacks provide a synthetic, temporary OpenBoxes demo VPC, private MySQL 8.4.11 RDS instance, application database secret, versioned uploads bucket and S3 Files file system, ECR repository, ECS cluster, one-shot database initialization task, application service, CloudFront distribution, and monthly budget. This is a synthetic demo environment, not a bank-approved deployment.
 
 ## Deploy
 
@@ -12,13 +12,13 @@ Use the default OIDC-backed AWS CLI credentials in account `077510937834`. The s
 ./infra/aws/run-db-init.sh
 ```
 
-`deploy.sh` runs `preflight.sh` before deploying. The preflight fetches the CloudFormation registry schemas for both templates and lints them, then asks ECS to validate a temporary DB-init task-definition revision when the data stack already provides real values. On the first deployment, the ECS check is skipped until those values exist; run `./infra/aws/preflight.sh` again after deployment to exercise it. With the pinned `cfn-lint` 1.57.0, the registry-schema run ignores E1020, E6101, and E1041 because the downloaded AWS schemas raise `anyOf` exceptions for intrinsic references and mischeck the DB-init log-group `Ref`. It also ignores W3010 for the fixed Availability Zones required by the spec. Set `SKIP_PREFLIGHT=1` only when intentionally bypassing these checks.
+`deploy.sh` runs `preflight.sh` before deploying. The preflight fetches CloudFormation registry schemas for every resource in `network.yaml` and `data.yaml`, and also `app.yaml` when present, then lints those templates. It asks ECS to validate temporary task-definition revisions for the DB-init and application task when the data stack and `APP_IMAGE_URI` provide real values. The app registration uses the existing DB-init execution role only for this API-side shape check; the app task and execution roles are created by the first app-stack deployment. It is not run as a task. The CloudFront URL in this temporary definition is a placeholder because CloudFront creates that hostname. With the pinned `cfn-lint` 1.57.0, the registry-schema run ignores E1020, E6101, and E1041 because the downloaded AWS schemas raise `anyOf` exceptions for intrinsic references and mischeck the DB-init log-group `Ref`. It also ignores W3010 for the fixed Availability Zones required by the spec. Set `SKIP_PREFLIGHT=1` only when intentionally bypassing these checks.
 
 The acceptance check confirmed that this `cfn-lint` version does not reject `S3FilesFileSystem.Bucket: !Ref UploadsBucket`; CloudFormation's registry rejects that bucket-name form. Keep the ARN-valued `!GetAtt UploadsBucket.Arn` in `data.yaml`.
 
 The network stack is deployed before the data stack. The one-shot task receives a public IP in a public subnet so it can pull the public MySQL image and RDS CA bundle; it has no inbound rules. App task ingress is limited to the ALB security group, ALB ingress is limited to the CloudFront origin-facing prefix list, and the database uses private subnets.
 
-For a diagnostic data-stack deployment that preserves resources if creation fails, opt in with `DISABLE_ROLLBACK=1 ./infra/aws/deploy.sh`. The default deploy behavior is unchanged; use this only when you need to inspect and manually recover a failed deployment.
+For a diagnostic data- or app-stack deployment that preserves resources if creation fails, opt in with `DISABLE_ROLLBACK=1`. The default deploy behavior is unchanged; use this only when you need to inspect and manually recover a failed deployment.
 
 The initialization task is safe to repeat. It creates the `openboxes` schema using `utf8`/`utf8_general_ci`, creates the SSL-required application user with only the schema grants needed by OpenBoxes, and prints connection/schema verification results without printing passwords.
 
@@ -28,7 +28,7 @@ Run `./infra/aws/run-db-init.sh` twice and confirm both executions exit successf
 
 ## Outputs
 
-The data stack exports the DB endpoint and port, master and app secret ARNs, uploads bucket name, S3 Files file system and access point ARNs, ECR repository URI, ECS cluster name, and DB-init task definition ARN. The network stack exports its VPC, subnet, and security-group IDs for later demo stacks.
+The data stack exports the DB endpoint and port, master and app secret ARNs, uploads bucket name, S3 Files file system and access point ARNs, ECR repository URI, ECS cluster name, and DB-init task definition ARN. The network stack exports its VPC, subnet, and security-group IDs for later demo stacks. The app stack outputs the CloudFront domain and URL, ALB DNS name, ECS service and task-definition names, and application log group.
 
 ## Cost and cleanup
 
@@ -41,3 +41,45 @@ After dependent app and observability stacks have been removed, cleanup can be s
 ```
 
 Cleanup empties uploads object versions and delete markers, removes ECR images, disables DB deletion protection, then deletes the data and network stacks. The RDS deletion policy retains a final snapshot; the script prints its identifier and a separate command to delete it if appropriate. Do not run cleanup while later PRs still depend on these stacks.
+
+## Build, deploy, and cut over the application
+
+Build and push the existing WAR without rebuilding it when it is already present. The script builds the upstream base image from `build/docker`, adds the RDS CA truststore, pushes an immutable Git-SHA/timestamp tag, and prints the ECR digest URI. Use that digest for every deployment:
+
+```bash
+IMAGE_URI="$(./infra/aws/build-push.sh)"
+APP_IMAGE_URI="$IMAGE_URI" DESIRED_COUNT=0 DISABLE_ROLLBACK=1 ./infra/aws/deploy.sh
+./infra/aws/migrate.sh
+```
+
+The app deploy first creates `openboxes-demo-app` with zero tasks. `migrate.sh` performs a read-only dump from the running `baseline-mysql`, strips DEFINER clauses, compresses and uploads it under `migration/<timestamp>/` (outside the S3 Files `uploads/` prefix), presigns it for 15 minutes, then runs the DB-init task in restore mode with TLS identity verification. On success, it deletes the dump object, updates the app stack's `DesiredCount` to 1, and waits for ECS stability. The default restore refuses to overwrite an `openboxes` schema with tables; use `./infra/aws/migrate.sh --force` only when intentionally replacing that schema. The restore task registers a temporary revision in the existing DB-init family to inject the generated admin UI password as an ECS secret, then deregisters and deletes that revision after the task stops.
+
+The app stack generates the admin UI password at `openboxes-demo/admin-ui`; retrieve it from Secrets Manager only when needed, and never put it in shell history or logs. The generated value replaces the default `admin/password` account credential during restore.
+
+The app uses Java 8-compatible heap bounds (`-Xms2048m -Xmx2867m`) for its 4-GiB task. The upstream Temurin 8u504 image rejects `InitialRAMPercentage` and `MaxRAMPercentage`; these fixed bounds preserve the specified 50% initial / 70% maximum sizing.
+
+The pool configuration sets `maxActive=20`. The local concurrency check did not prove the requested `maxIdle=10` cap, so that property is intentionally omitted.
+
+Use the PR 1 browser journey in a separate worktree, without merging it into this branch:
+
+```bash
+git worktree add /home/ubuntu/journey-wt devin/1790640578-baseline-journey
+cd /home/ubuntu/journey-wt/e2e/demo-journey
+npm install
+BASE_URL="https://<CloudFrontDomain>/openboxes" OB_USER=admin OB_PASSWORD="<admin-ui-secret>" npm test
+BASE_URL="https://<CloudFrontDomain>/openboxes" OB_USER=admin OB_PASSWORD="<admin-ui-secret>" PRODUCT_CODE="<baseline-product-code>" npm run test:verify
+```
+
+The journey state records the product code; use it for the persistence check after restarting the ECS service task. Keep the Playwright screenshots, video, trace, and HTML report as deployment evidence.
+
+## Application verification and rollback
+
+Verify the app stack is `CREATE_COMPLETE` and the ECS service is stable with exactly one running task. Confirm `https://<CloudFrontDomain>/openboxes/health` returns `{"status":"UP"}`; `/openboxes/dbconsole`, `/openboxes/console`, `/openboxes/env`, and `/openboxes/info` return 403 through CloudFront; direct ALB requests time out from outside CloudFront's origin-facing prefix list (requests from CloudFront without `X-Origin-Verify` get the listener's default 403); and the task public IP is not reachable on port 8080. Confirm `admin/password` cannot log in. Inspect the app logs for successful Liquibase startup, no startup stack traces, `sslMode=VERIFY_IDENTITY`, and no `allowPublicKeyRetrieval`. Force a new ECS deployment, confirm the task ARN changes, and rerun the Playwright persistence spec. A one-off app task should write an `uploads/probe-<timestamp>.txt` file through `/app/uploads`; record how long it takes to appear in the bucket, then delete the probe. Objects land under `uploads/uploads/` because the file system prefix is `uploads/` and the access point root is `/uploads`; about 66 seconds was observed.
+
+Use `DISABLE_ROLLBACK=1` for the initial app-stack create so failed creates remain available for inspection. CloudFormation rejects task-definition replacement updates when rollback is disabled; if an update is left in `UPDATE_FAILED`, run `aws cloudformation rollback-stack --stack-name openboxes-demo-app`, wait for `UPDATE_ROLLBACK_COMPLETE`, and retry with rollback enabled. Inspect events and update the existing stack after correcting a mechanical issue; do not delete and recreate it unless an update cannot recover it. If restore fails, keep the service at zero and retain the uploaded migration object for diagnosis or retry. Once restore and cutover succeed, scaling the service back to zero is a reversible rollback that leaves the app and data stacks intact:
+
+```bash
+APP_IMAGE_URI="<current-image-digest-uri>" DESIRED_COUNT=0 SKIP_PREFLIGHT=1 ./infra/aws/deploy.sh
+```
+
+Do not run `cleanup.sh` while this app stack or any later stack depends on the network/data stacks.

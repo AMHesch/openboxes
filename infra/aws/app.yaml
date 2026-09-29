@@ -1,0 +1,496 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: OpenBoxes application service and CloudFront entry point
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: ECR image URI pinned by digest
+    AllowedPattern: '^077510937834\.dkr\.ecr\.us-east-1\.amazonaws\.com/openboxes-demo@sha256:[0-9a-f]{64}$'
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+
+Resources:
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /openboxes-demo/app
+      RetentionInDays: 14
+
+  AlbLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub openboxes-demo-alb-logs-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-alb-access-logs
+            Status: Enabled
+            Prefix: ''
+            ExpirationInDays: 14
+
+  AlbLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AlbLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLoadBalancerLogDelivery
+            Effect: Allow
+            Principal:
+              Service: logdelivery.elasticloadbalancing.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:${AWS::Partition}:s3:::${AlbLogBucket}/AWSLogs/${AWS::AccountId}/*
+
+  OriginVerifySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: openboxes-demo/origin-verify
+      Description: Private header shared by CloudFront and the application load balancer
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  AdminUiSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: openboxes-demo/admin-ui
+      Description: Generated OpenBoxes admin UI password
+      GenerateSecretString:
+        PasswordLength: 20
+        ExcludePunctuation: true
+
+  DbInitRestoreSecretPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: openboxes-demo-db-init-admin-secret
+      Roles:
+        - openboxes-demo-db-init-exec
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref AdminUiSecret
+
+  AppTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: openboxes-demo-app-exec
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: openboxes-demo-app-execution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcrAuthorization
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrImagePull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/openboxes-demo
+              - Sid: WriteApplicationLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/openboxes-demo/app:log-stream:*
+              - Sid: ReadDatabaseSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !ImportValue openboxes-demo-AppSecretArn
+
+  AppTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: openboxes-demo-app-task
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: openboxes-demo-app-runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3FilesClientAccess
+                Effect: Allow
+                Action:
+                  - s3files:ClientMount
+                  - s3files:ClientWrite
+                Resource:
+                  - !ImportValue openboxes-demo-FileSystemArn
+                  - !ImportValue openboxes-demo-AccessPointArn
+                Condition:
+                  StringEquals:
+                    s3files:AccessPointArn: !ImportValue openboxes-demo-AccessPointArn
+              - Sid: ReadUploadedObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  Fn::Sub:
+                    - arn:${AWS::Partition}:s3:::${BucketName}/*
+                    - BucketName:
+                        Fn::ImportValue: openboxes-demo-UploadsBucket
+              - Sid: ListUploadsBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource:
+                  Fn::Sub:
+                    - arn:${AWS::Partition}:s3:::${BucketName}
+                    - BucketName:
+                        Fn::ImportValue: openboxes-demo-UploadsBucket
+
+  AppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: openboxes-demo-app
+      Cpu: '1024'
+      Memory: '4096'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt AppTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt AppTaskRole.Arn
+      Volumes:
+        - Name: uploads
+          S3FilesVolumeConfiguration:
+            FileSystemArn: !ImportValue openboxes-demo-FileSystemArn
+            AccessPointArn: !ImportValue openboxes-demo-AccessPointArn
+      ContainerDefinitions:
+        - Name: openboxes
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          StopTimeout: 120
+          ReadonlyRootFilesystem: false
+          Environment:
+            - Name: DATASOURCE_URL
+              Value: !Join
+                - ''
+                - - 'jdbc:mysql://'
+                  - !ImportValue openboxes-demo-DbEndpoint
+                  - ':3306/openboxes?serverTimezone=UTC&sslMode=VERIFY_IDENTITY&trustCertificateKeyStoreUrl=file:/app/rds-ca.p12&trustCertificateKeyStoreType=PKCS12&trustCertificateKeyStorePassword=changeit'
+            - Name: DATASOURCE_USERNAME
+              Value: openboxes
+            - Name: GRAILS_SERVER_URL
+              Value: !Sub https://${AppDistribution.DomainName}/openboxes
+            - Name: JAVA_TOOL_OPTIONS
+              Value: >-
+                -Xms2048m -Xmx2867m -XX:+UseParallelGC
+                -XX:+ExitOnOutOfMemoryError -Djava.awt.headless=true
+                -DdataSource.properties.maxActive=20
+          Secrets:
+            - Name: DATASOURCE_PASSWORD
+              ValueFrom:
+                Fn::Join:
+                  - ''
+                  - - Fn::ImportValue: openboxes-demo-AppSecretArn
+                    - ':password::'
+          MountPoints:
+            - SourceVolume: uploads
+              ContainerPath: /app/uploads
+              ReadOnly: false
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -fs http://localhost:8080/openboxes/health | grep -q UP || exit 1
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 300
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: openboxes-demo-app
+      VpcId: !ImportValue openboxes-demo-VpcId
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /openboxes/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'false'
+
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - AlbLogBucketPolicy
+    Properties:
+      Name: openboxes-demo-alb
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - !ImportValue openboxes-demo-PublicSubnetA
+        - !ImportValue openboxes-demo-PublicSubnetB
+      SecurityGroups:
+        - !ImportValue openboxes-demo-AlbSg
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: 'true'
+        - Key: access_logs.s3.bucket
+          Value: !Ref AlbLogBucket
+        - Key: idle_timeout.timeout_seconds
+          Value: '120'
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+
+  AppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '403'
+            ContentType: text/plain
+            MessageBody: Forbidden
+
+  BlockManagementRuleOne:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AppListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /openboxes/dbconsole*
+              - /openboxes/console*
+              - /openboxes/env*
+              - /openboxes/beans*
+              - /openboxes/metrics*
+      Actions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '403'
+            ContentType: text/plain
+            MessageBody: Forbidden
+
+  BlockManagementRuleTwo:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AppListener
+      Priority: 2
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /openboxes/mappings*
+              - /openboxes/configprops*
+              - /openboxes/dump*
+              - /openboxes/trace*
+              - /openboxes/heapdump*
+      Actions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '403'
+            ContentType: text/plain
+            MessageBody: Forbidden
+
+  BlockManagementRuleThree:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AppListener
+      Priority: 3
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /openboxes/autoconfig*
+              - /openboxes/loggers*
+              - /openboxes/auditevents*
+              - /openboxes/info*
+      Actions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '403'
+            ContentType: text/plain
+            MessageBody: Forbidden
+
+  AppRootRedirectRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AppListener
+      Priority: 4
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - '{{resolve:secretsmanager:openboxes-demo/origin-verify:SecretString}}'
+      Actions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: '#{protocol}'
+            Port: '#{port}'
+            Host: '#{host}'
+            Path: /openboxes/
+            Query: '#{query}'
+            StatusCode: HTTP_301
+
+  AppForwardRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AppListener
+      Priority: 5
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - '{{resolve:secretsmanager:openboxes-demo/origin-verify:SecretString}}'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  AppService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - AppForwardRule
+    Properties:
+      ServiceName: openboxes-demo-app
+      Cluster: !ImportValue openboxes-demo-ClusterName
+      TaskDefinition: !Ref AppTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      HealthCheckGracePeriodSeconds: 600
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !ImportValue openboxes-demo-AppSg
+          Subnets:
+            - !ImportValue openboxes-demo-PublicSubnetA
+            - !ImportValue openboxes-demo-PublicSubnetB
+      LoadBalancers:
+        - ContainerName: openboxes
+          ContainerPort: 8080
+          TargetGroupArn: !Ref AppTargetGroup
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      EnableExecuteCommand: false
+
+  AppDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn:
+      - AppForwardRule
+    Properties:
+      DistributionConfig:
+        Comment: OpenBoxes demo distribution
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: AppAlbOrigin
+            DomainName: !GetAtt AppLoadBalancer.DNSName
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: '{{resolve:secretsmanager:openboxes-demo/origin-verify:SecretString}}'
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: AppAlbOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - PATCH
+            - POST
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+          Compress: true
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+Outputs:
+  AppUrl:
+    Description: Public HTTPS URL for OpenBoxes
+    Value: !Sub https://${AppDistribution.DomainName}/openboxes
+  CloudFrontDomainName:
+    Description: CloudFront distribution hostname
+    Value: !GetAtt AppDistribution.DomainName
+  AlbDnsName:
+    Description: Application load balancer hostname
+    Value: !GetAtt AppLoadBalancer.DNSName
+  ServiceName:
+    Description: ECS application service name
+    Value: !Ref AppService
+  TaskDefinitionArn:
+    Description: ECS application task definition ARN
+    Value: !Ref AppTaskDefinition
+  LogGroupName:
+    Description: Application log group
+    Value: !Ref AppLogGroup
