@@ -8,12 +8,16 @@ data_stack=openboxes-demo-data
 network_template="${NETWORK_TEMPLATE:-$script_dir/network.yaml}"
 data_template="${DATA_TEMPLATE:-$script_dir/data.yaml}"
 app_template="${APP_TEMPLATE:-$script_dir/app.yaml}"
+observability_template="${OBSERVABILITY_TEMPLATE:-$script_dir/observability.yaml}"
 cfn_lint="${CFN_LINT:-cfn-lint}"
 jq_bin="${JQ:-jq}"
 templates=("$network_template" "$data_template")
 
 if [[ -f "$app_template" ]]; then
   templates+=("$app_template")
+fi
+if [[ -f "$observability_template" ]]; then
+  templates+=("$observability_template")
 fi
 
 for tool in aws "$cfn_lint" "$jq_bin" awk sort mktemp; do
@@ -92,6 +96,14 @@ printf 'Linting %s templates with %s registry schemas.\n' "${#templates[@]}" "${
   --ignore-checks E1020 E6101 E1041 W3010 \
   --template \
   "${templates[@]}"
+
+for template in "${templates[@]}"; do
+  printf 'Validating CloudFormation template: %s\n' "$template"
+  aws cloudformation validate-template \
+    --template-body "file://$template" \
+    --region "$region" \
+    --output json >/dev/null
+done
 
 ecs_cli() {
   local name="$1"

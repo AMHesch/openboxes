@@ -83,3 +83,44 @@ APP_IMAGE_URI="<current-image-digest-uri>" DESIRED_COUNT=0 SKIP_PREFLIGHT=1 ./in
 ```
 
 Do not run `cleanup.sh` while this app stack or any later stack depends on the network/data stacks.
+
+## Observability and incident drill
+
+The observability stack is deployed after the application stack and leaves the application service running:
+
+```bash
+./infra/aws/deploy-observability.sh
+```
+
+The helper resolves the CloudFront application URL, ALB and target-group CloudWatch dimensions, and uses the documented Main Warehouse location id `1` unless `LOCATION_ID` is supplied. The id was determined from the deployed login flow: after a successful login, the Main Warehouse link is `/openboxes/dashboard/chooseLocation/1?targetUri=`. Set `PROBE_STATE=DISABLED` only when intentionally pausing the one-minute schedule. Set `WEBHOOK_URL` only after creating `openboxes-demo/devin-webhook`; the helper verifies that secret with `describe-secret` and never reads or prints its value.
+
+Resources include the 14-day `/openboxes-demo/probe` log group, a Python 3.12 Lambda login probe, a least-privilege probe role, an EventBridge Scheduler schedule (`rate(1 minute)` with retries disabled), lock-wait and Spring Boot error metric filters on `/openboxes-demo/app`, four CloudWatch alarms, the `openboxes-demo` dashboard, and the read-only `openboxes-demo-investigator` role. The probe reads only `openboxes-demo/admin-ui-*`, uses an HTTP cookie jar, submits the deployed form at `/auth/handleLogin`, selects the configured location, and emits one EMF JSON line per invocation. It never logs the password, cookies, or response bodies.
+
+| Alarm | Metric and threshold | Missing data |
+| --- | --- | --- |
+| `openboxes-demo-login-probe-failing` | `LoginFailure >= 1` in 2 of 3 one-minute periods | Not breaching |
+| `openboxes-demo-lock-wait-timeouts` | `LockWaitTimeouts >= 1` in 1 of 1 one-minute period | Not breaching |
+| `openboxes-demo-alb-target-5xx` | ALB target 5xx `>= 3` in 2 of 3 one-minute periods | Not breaching |
+| `openboxes-demo-no-healthy-target` | `HealthyHostCount < 1` in 3 of 3 one-minute periods | Breaching |
+
+Only the login-probe alarm is routed to the optional Devin EventBridge API destination. When `WEBHOOK_URL` is supplied, the stack creates the API-key connection using the dynamic reference `openboxes-demo/devin-webhook`, a one-request-per-second destination, an SSE-enabled four-day SQS DLQ, and a rule that forwards only the probe alarm's `ALARM` state-change event with two retries and a 3,600-second maximum event age. The complete CloudWatch event is sent as the request body without an input transformer.
+
+The dashboard includes alarm state, probe success/failure/latency and Lambda errors, application lock/error metrics, ALB request/5xx/latency metrics, ECS CPU/memory, RDS CPU/connections/freeable memory, and Logs Insights views for application and drill events. The investigator role trusts only `arn:aws:iam::077510937834:role/devin-sessions`; it permits read-only CloudWatch, Logs, ECS describe/list, RDS describe/log, ELB describe, CloudTrail lookup, EventBridge describe/list, Scheduler get, and probe Lambda configuration reads. It does not grant Secrets Manager, S3, SSM, ECS execute-command/run-task/stop-task/update-service, or any write action.
+
+### Incident drill
+
+The drill uses the existing DB-init Fargate task definition and the same public subnets, one-shot security group, public IP, TLS CA bundle, and application secret wiring as `run-db-init.sh`. It starts a transaction, locks the `admin` row with `SELECT id ... FOR UPDATE`, emits a JSON lock-acquired event, sleeps, rolls back, and emits a JSON lock-released event. It does not modify data.
+
+```bash
+./infra/aws/drill.sh start [--seconds N]  # 60 through 900; default 600
+./infra/aws/drill.sh status
+./infra/aws/drill.sh stop
+```
+
+The expected sequence is task start, lock acquisition in `/openboxes-demo/db-init`, the next probe failure, the first `LockWaitTimeouts` datapoint, the probe alarm entering `ALARM`, then `drill.sh stop`, probe recovery, and alarm `OK`. The measured UTC timeline is recorded with the PR verification evidence and should be used rather than assuming fixed propagation times. `/openboxes/health` should remain up and the ECS application task ARN should remain unchanged. The lock-to-login-failure behavior is a deployment hypothesis: if the probe does not fail while the lock is held, stop the verification and report that result rather than changing the drill or alarm thresholds.
+
+The optional playbook is intentionally not included in this demo:
+
+Playbook: infra/aws/incident/playbook.md
+
+Known limitations: CloudWatch metric filters and alarms are intentionally fixed to the thresholds above; the direct ALB is not reachable from an external runner when ingress is limited to the CloudFront origin-facing prefix list; and Lambda `Errors` appears on the dashboard to expose probe-runtime failures even though the synthetic `LoginFailure` alarm treats missing data as not breaching.
