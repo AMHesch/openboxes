@@ -1,0 +1,679 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: OpenBoxes demo data services and database initialization
+
+Resources:
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: openboxes-demo-db-subnets
+      DBSubnetGroupDescription: OpenBoxes demo private database subnets
+      SubnetIds:
+        - !ImportValue openboxes-demo-DbSubnetA
+        - !ImportValue openboxes-demo-DbSubnetB
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-db-subnets
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  DbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: openboxes-demo-mysql84
+      Description: OpenBoxes MySQL 8.4 parameters
+      Family: mysql8.4
+      Parameters:
+        require_secure_transport: '1'
+        time_zone: UTC
+        sql_mode: ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+        slow_query_log: '1'
+        long_query_time: '1'
+        log_output: FILE
+        innodb_print_all_deadlocks: '1'
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-mysql84
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  OpenBoxesDatabase:
+    Type: AWS::RDS::DBInstance
+    DependsOn:
+      - S3FilesMountTargetA
+      - S3FilesMountTargetB
+      - S3FilesAccessPoint
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: openboxes-demo-db
+      Engine: mysql
+      EngineVersion: '8.4.11'
+      EngineLifecycleSupport: open-source-rds-extended-support-disabled
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: '20'
+      MaxAllocatedStorage: 50
+      StorageType: gp3
+      StorageEncrypted: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !ImportValue openboxes-demo-DbSg
+      AvailabilityZone: us-east-1a
+      MultiAZ: false
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: false
+      ManageMasterUserPassword: true
+      MasterUsername: obadmin
+      CACertificateIdentifier: rds-ca-rsa2048-g1
+      BackupRetentionPeriod: 7
+      DeletionProtection: true
+      CopyTagsToSnapshot: true
+      EnableCloudwatchLogsExports:
+        - error
+        - slowquery
+      EnablePerformanceInsights: false
+      MonitoringInterval: 0
+      DBParameterGroupName: !Ref DbParameterGroup
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-db
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  AppDbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: openboxes-demo/app-db
+      Description: OpenBoxes application database credentials
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"openboxes"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub openboxes-demo-uploads-${AWS::AccountId}
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireNoncurrentVersionsAfterSevenDays
+            Status: Enabled
+            Prefix: ''
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+          - Id: AbortIncompleteMultipartUploadsAfterSevenDays
+            Status: Enabled
+            Prefix: ''
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub openboxes-demo-uploads-${AWS::AccountId}
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  UploadsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UploadsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt UploadsBucket.Arn
+              - !Sub '${UploadsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  S3FilesSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: openboxes-demo-s3files-sync
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3FilesAssumeRole
+            Effect: Allow
+            Principal:
+              Service: elasticfilesystem.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:s3files:${AWS::Region}:${AWS::AccountId}:file-system/*
+      Policies:
+        - PolicyName: openboxes-demo-s3files-sync
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3BucketPermissions
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource: !GetAtt UploadsBucket.Arn
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+                  StringLike:
+                    s3:prefix:
+                      - uploads/
+                      - uploads/*
+              - Sid: S3ObjectPermissions
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:DeleteObject*
+                  - s3:GetObject*
+                  - s3:List*
+                  - s3:PutObject*
+                Resource: !Sub '${UploadsBucket.Arn}/uploads/*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Sid: UseKmsKeyWithS3Files
+                Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncryptFrom
+                  - kms:ReEncryptTo
+                Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:*
+                Condition:
+                  StringLike:
+                    kms:ViaService: !Sub s3.${AWS::Region}.amazonaws.com
+                    'kms:EncryptionContext:aws:s3:arn':
+                      - !Sub '${UploadsBucket.Arn}/uploads/*'
+              - Sid: EventBridgeManage
+                Effect: Allow
+                Action:
+                  - events:DeleteRule
+                  - events:DisableRule
+                  - events:EnableRule
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                Resource: !Sub arn:${AWS::Partition}:events:*:*:rule/DO-NOT-DELETE-S3-Files*
+                Condition:
+                  StringEquals:
+                    events:ManagedBy: elasticfilesystem.amazonaws.com
+              - Sid: EventBridgeRead
+                Effect: Allow
+                Action:
+                  - events:DescribeRule
+                  - events:ListRuleNamesByTarget
+                  - events:ListRules
+                  - events:ListTargetsByRule
+                Resource: !Sub arn:${AWS::Partition}:events:*:*:rule/*
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-s3files-sync
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  S3FilesFileSystem:
+    Type: AWS::S3Files::FileSystem
+    Properties:
+      Bucket: !GetAtt UploadsBucket.Arn
+      Prefix: uploads/
+      RoleArn: !GetAtt S3FilesSyncRole.Arn
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-uploads-filesystem
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  S3FilesMountTargetA:
+    Type: AWS::S3Files::MountTarget
+    Properties:
+      FileSystemId: !GetAtt S3FilesFileSystem.FileSystemId
+      SubnetId: !ImportValue openboxes-demo-PublicSubnetA
+      SecurityGroups:
+        - !ImportValue openboxes-demo-MountTargetSg
+
+  S3FilesMountTargetB:
+    Type: AWS::S3Files::MountTarget
+    Properties:
+      FileSystemId: !GetAtt S3FilesFileSystem.FileSystemId
+      SubnetId: !ImportValue openboxes-demo-PublicSubnetB
+      SecurityGroups:
+        - !ImportValue openboxes-demo-MountTargetSg
+
+  S3FilesAccessPoint:
+    Type: AWS::S3Files::AccessPoint
+    Properties:
+      FileSystemId: !GetAtt S3FilesFileSystem.FileSystemId
+      PosixUser:
+        Uid: '1000'
+        Gid: '1000'
+      RootDirectory:
+        Path: /uploads
+        CreationPermissions:
+          OwnerUid: '1000'
+          OwnerGid: '1000'
+          Permissions: '0755'
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-uploads-access-point
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: openboxes-demo
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: false
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep the most recent 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-ecr
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: openboxes-demo
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: openboxes-demo
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  DbInitLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /openboxes-demo/db-init
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  DbInitExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: openboxes-demo-db-init-exec
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: openboxes-demo-db-init-execution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcrAuthorization
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrImagePull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: !GetAtt EcrRepository.Arn
+              - Sid: WriteDbInitLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/openboxes-demo/db-init:log-stream:*
+              - Sid: ReadDatabaseSecrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - Fn::GetAtt:
+                      - OpenBoxesDatabase
+                      - MasterUserSecret.SecretArn
+                  - !Ref AppDbSecret
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-db-init-exec
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  DbInitTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: openboxes-demo-db-init
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt DbInitExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: db-init
+          Image: public.ecr.aws/docker/library/mysql:8.4.11
+          Essential: true
+          EntryPoint:
+            - sh
+            - -c
+          Command:
+            - |
+              set -eu
+              bundle=/tmp/us-east-1-bundle.pem
+              if ! command -v curl >/dev/null 2>&1; then
+                printf '%s\n' 'curl is required to download the RDS CA bundle' >&2
+                exit 127
+              fi
+              curl --fail --silent --show-error --location https://truststore.pki.rds.amazonaws.com/us-east-1/us-east-1-bundle.pem -o "$bundle"
+              export MYSQL_PWD="$MASTER_PASSWORD"
+              mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca="$bundle" -h "$DB_HOST" -u "$MASTER_USER" <<SQL
+              CREATE DATABASE IF NOT EXISTS openboxes CHARACTER SET utf8 COLLATE utf8_general_ci;
+              CREATE USER IF NOT EXISTS 'openboxes'@'%' IDENTIFIED BY '${APP_PASSWORD}' REQUIRE SSL;
+              ALTER USER 'openboxes'@'%' IDENTIFIED BY '${APP_PASSWORD}' REQUIRE SSL;
+              GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES, CREATE VIEW, SHOW VIEW, CREATE TEMPORARY TABLES, LOCK TABLES ON openboxes.* TO 'openboxes'@'%';
+              SQL
+              mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca="$bundle" -h "$DB_HOST" -u "$MASTER_USER" <<'SQL'
+              SELECT @@version;
+              SHOW VARIABLES LIKE 'require_secure_transport';
+              SELECT @@GLOBAL.sql_mode, @@GLOBAL.time_zone;
+              SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = 'openboxes';
+              SHOW GRANTS FOR 'openboxes'@'%';
+              SHOW STATUS LIKE 'Ssl_cipher';
+              SHOW VARIABLES LIKE 'max_connections';
+              SQL
+          Environment:
+            - Name: DB_HOST
+              Value: !GetAtt OpenBoxesDatabase.Endpoint.Address
+          Secrets:
+            - Name: MASTER_USER
+              ValueFrom:
+                Fn::Join:
+                  - ''
+                  - - Fn::GetAtt:
+                        - OpenBoxesDatabase
+                        - MasterUserSecret.SecretArn
+                    - ':username::'
+            - Name: MASTER_PASSWORD
+              ValueFrom:
+                Fn::Join:
+                  - ''
+                  - - Fn::GetAtt:
+                        - OpenBoxesDatabase
+                        - MasterUserSecret.SecretArn
+                    - ':password::'
+            - Name: APP_PASSWORD
+              ValueFrom: !Join ['', [!Ref AppDbSecret, ':password::']]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref DbInitLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: db-init
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-db-init
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  DemoMonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: openboxes-demo-monthly
+        BudgetLimit:
+          Amount: 150
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters:
+          TagKeyValue:
+            - user:Project$openboxes-demo
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: amhesch@gmail.com
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: amhesch@gmail.com
+Outputs:
+  DbEndpoint:
+    Description: RDS MySQL endpoint hostname
+    Value: !GetAtt OpenBoxesDatabase.Endpoint.Address
+    Export:
+      Name: openboxes-demo-DbEndpoint
+  DbPort:
+    Description: RDS MySQL port
+    Value: !GetAtt OpenBoxesDatabase.Endpoint.Port
+    Export:
+      Name: openboxes-demo-DbPort
+  MasterSecretArn:
+    Description: RDS-managed master secret ARN
+    Value:
+      Fn::GetAtt:
+        - OpenBoxesDatabase
+        - MasterUserSecret.SecretArn
+    Export:
+      Name: openboxes-demo-MasterSecretArn
+  AppSecretArn:
+    Description: OpenBoxes application database secret ARN
+    Value: !Ref AppDbSecret
+    Export:
+      Name: openboxes-demo-AppSecretArn
+  UploadsBucket:
+    Description: Versioned OpenBoxes uploads bucket name
+    Value: !Ref UploadsBucket
+    Export:
+      Name: openboxes-demo-UploadsBucket
+  FileSystemArn:
+    Description: S3 Files file system ARN
+    Value: !GetAtt S3FilesFileSystem.FileSystemArn
+    Export:
+      Name: openboxes-demo-FileSystemArn
+  AccessPointArn:
+    Description: S3 Files access point ARN
+    Value: !GetAtt S3FilesAccessPoint.AccessPointArn
+    Export:
+      Name: openboxes-demo-AccessPointArn
+  EcrRepositoryUri:
+    Description: OpenBoxes ECR repository URI
+    Value: !GetAtt EcrRepository.RepositoryUri
+    Export:
+      Name: openboxes-demo-EcrRepositoryUri
+  ClusterName:
+    Description: OpenBoxes ECS cluster name
+    Value: !Ref EcsCluster
+    Export:
+      Name: openboxes-demo-ClusterName
+  DbInitTaskDefinition:
+    Description: Database initialization task definition ARN
+    Value: !Ref DbInitTaskDefinition
+    Export:
+      Name: openboxes-demo-DbInitTaskDefinition
