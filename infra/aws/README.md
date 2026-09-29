@@ -117,10 +117,8 @@ The drill uses the existing DB-init Fargate task definition and the same public 
 ./infra/aws/drill.sh stop
 ```
 
-The expected sequence is task start, lock acquisition in `/openboxes-demo/db-init`, the next probe failure, the first `LockWaitTimeouts` datapoint, the probe alarm entering `ALARM`, then `drill.sh stop`, probe recovery, and alarm `OK`. The measured UTC timeline is recorded with the PR verification evidence and should be used rather than assuming fixed propagation times. `/openboxes/health` should remain up and the ECS application task ARN should remain unchanged. The lock-to-login-failure behavior is a deployment hypothesis: if the probe does not fail while the lock is held, stop the verification and report that result rather than changing the drill or alarm thresholds.
+The expected sequence is task start, lock acquisition in `/openboxes-demo/db-init`, the next probe failure, the first `LockWaitTimeouts` datapoint, the probe alarm entering `ALARM`, then `drill.sh stop`, probe recovery, and alarm `OK`. The measured UTC timeline is recorded with the PR verification evidence and should be used rather than assuming fixed propagation times. `/openboxes/health` should remain up and the ECS application task ARN should remain unchanged. In the verified run, the first probe failure came about 80 s after the drill task started (`choose_location` returned HTTP 500 after about 57 s), the lock-wait alarm fired about 2 min in, and the probe alarm about 3 min in. After `drill.sh stop`, the next probe succeeded within about 35 s and both alarms returned to `OK` within about 3 min.
 
-The optional playbook is intentionally not included in this demo:
-
-Playbook: infra/aws/incident/playbook.md
+The Devin investigation playbook is versioned at `infra/aws/incident/playbook.md`. It is read-only: it assumes `openboxes-demo-investigator`, keeps one open GitHub issue per alarm name, and leaves every mitigation to a human.
 
 Known limitations: CloudWatch metric filters and alarms are intentionally fixed to the thresholds above; the direct ALB is not reachable from an external runner when ingress is limited to the CloudFront origin-facing prefix list; and Lambda `Errors` appears on the dashboard to expose probe-runtime failures even though the synthetic `LoginFailure` alarm treats missing data as not breaching.
