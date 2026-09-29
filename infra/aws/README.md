@@ -1,5 +1,7 @@
 # OpenBoxes AWS demo: network and data
 
+[Executive demo runbook](DEMO-RUNBOOK.md) — narrative, rehearsal checklist, and recovery steps.
+
 These stacks provide a synthetic, temporary OpenBoxes demo VPC, private MySQL 8.4.11 RDS instance, application database secret, versioned uploads bucket and S3 Files file system, ECR repository, ECS cluster, one-shot database initialization task, application service, CloudFront distribution, and monthly budget. This is a synthetic demo environment, not a bank-approved deployment.
 
 ## Deploy
@@ -26,7 +28,7 @@ The initialization task is safe to repeat. It creates the `openboxes` schema usi
 
 ## Verify and rollback
 
-Run `./infra/aws/run-db-init.sh` twice and confirm both executions exit successfully. Inspect the exported outputs with `aws cloudformation describe-stacks --stack-name openboxes-demo-data --region us-east-1 --query 'Stacks[0].Outputs'`. CloudFormation rolls back a failed create/update automatically; if the demo should be removed after dependent stacks are gone, use the explicit cleanup command below.
+Run `./infra/aws/run-db-init.sh` twice and confirm both executions exit successfully. Inspect the exported outputs with `aws cloudformation describe-stacks --stack-name openboxes-demo-data --region us-east-1 --query 'Stacks[0].Outputs'`. CloudFormation rolls back a failed create/update automatically. To retire the demo, run the cleanup command below; it removes the dependent app and observability stacks itself.
 
 ## Outputs
 
@@ -36,13 +38,13 @@ The data stack exports the DB endpoint and port, master and app secret ARNs, upl
 
 The monthly budget is USD 150, with an actual-cost alert above 80% and a forecast alert above 100%, sent to `amhesch@gmail.com`. These are alerts, not a spending cap. ECS tasks use public IPs in public subnets rather than a NAT gateway to keep this temporary demo smaller and less expensive; inbound access remains restricted by security groups. The `Project` cost-allocation tag must be activated once in Billing before tagged costs appear in the budget; this script does not change that account setting. Charges continue while resources remain deployed.
 
-After dependent app and observability stacks have been removed, cleanup can be started explicitly:
+Start cleanup explicitly when the demo is retired:
 
 ```bash
 ./infra/aws/cleanup.sh --yes
 ```
 
-Cleanup empties uploads object versions and delete markers, removes ECR images, disables DB deletion protection, then deletes the data and network stacks. The RDS deletion policy retains a final snapshot; the script prints its identifier and a separate command to delete it if appropriate. Do not run cleanup while later PRs still depend on these stacks.
+Cleanup deletes the observability stack and its webhook secret, empties the unversioned ALB access-log bucket if the app stack exists, then deletes the app stack. It disables DB deletion protection, empties uploads object versions and delete markers, removes ECR images, and deletes the data stack before deleting the leftover RDS `error`/`slowquery` and Container Insights log groups and the network stack. The RDS deletion policy retains a final snapshot; the script prints its identifier and a separate command to delete it if appropriate. Do not run cleanup while later PRs still depend on these stacks.
 
 ## Build, deploy, and cut over the application
 
