@@ -1,0 +1,14 @@
+{
+  "name": "openboxes-demo-journey",
+  "private": true,
+  "scripts": {
+    "test": "playwright test",
+    "test:verify": "playwright test verify.spec.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "22.16.5",
+    "typescript": "5.8.3"
+  }
+}
