@@ -1,0 +1,475 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: OpenBoxes demo network
+
+Parameters:
+  CloudFrontPrefixListId:
+    Type: String
+    Default: pl-3b927c52
+    Description: CloudFront origin-facing managed prefix list
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-vpc
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-igw
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  VpcInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: us-east-1a
+      CidrBlock: 10.42.0.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-public-a
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: us-east-1b
+      CidrBlock: 10.42.1.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-public-b
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  DbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: us-east-1a
+      CidrBlock: 10.42.20.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-db-a
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  DbSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: us-east-1b
+      CidrBlock: 10.42.21.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-db-b
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-public-rt
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcInternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  DbRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-db-rt
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  DbSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DbSubnetA
+      RouteTableId: !Ref DbRouteTable
+
+  DbSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DbSubnetB
+      RouteTableId: !Ref DbRouteTable
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: openboxes-demo-alb
+      GroupDescription: CloudFront to the demo load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          DestinationSecurityGroupId: !Ref AppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-alb
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: openboxes-demo-app
+      GroupDescription: OpenBoxes application tasks
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-app
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  OneshotSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: openboxes-demo-oneshot
+      GroupDescription: One-shot initialization tasks
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-oneshot
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  MountTargetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: openboxes-demo-mount-target
+      GroupDescription: S3 Files mount targets
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: 10.42.0.0/16
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-mount-target
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: openboxes-demo-db
+      GroupDescription: OpenBoxes MySQL database
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 10.42.0.0/16
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-db
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  AppFromAlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  AppToDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+
+  AppToMountTargetEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      DestinationSecurityGroupId: !Ref MountTargetSecurityGroup
+
+  OneshotToDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref OneshotSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+
+  MountTargetFromAppIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MountTargetSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref AppSecurityGroup
+
+  DbFromAppIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref AppSecurityGroup
+
+  DbFromOneshotIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref OneshotSecurityGroup
+
+Outputs:
+  VpcId:
+    Description: Demo VPC ID
+    Value: !Ref Vpc
+    Export:
+      Name: openboxes-demo-VpcId
+  PublicSubnetA:
+    Description: Public subnet in us-east-1a
+    Value: !Ref PublicSubnetA
+    Export:
+      Name: openboxes-demo-PublicSubnetA
+  PublicSubnetB:
+    Description: Public subnet in us-east-1b
+    Value: !Ref PublicSubnetB
+    Export:
+      Name: openboxes-demo-PublicSubnetB
+  DbSubnetA:
+    Description: Isolated database subnet in us-east-1a
+    Value: !Ref DbSubnetA
+    Export:
+      Name: openboxes-demo-DbSubnetA
+  DbSubnetB:
+    Description: Isolated database subnet in us-east-1b
+    Value: !Ref DbSubnetB
+    Export:
+      Name: openboxes-demo-DbSubnetB
+  AlbSg:
+    Description: ALB security group
+    Value: !Ref AlbSecurityGroup
+    Export:
+      Name: openboxes-demo-AlbSg
+  AppSg:
+    Description: Application task security group
+    Value: !Ref AppSecurityGroup
+    Export:
+      Name: openboxes-demo-AppSg
+  OneshotSg:
+    Description: One-shot task security group
+    Value: !Ref OneshotSecurityGroup
+    Export:
+      Name: openboxes-demo-OneshotSg
+  MountTargetSg:
+    Description: S3 Files mount target security group
+    Value: !Ref MountTargetSecurityGroup
+    Export:
+      Name: openboxes-demo-MountTargetSg
+  DbSg:
+    Description: Database security group
+    Value: !Ref DbSecurityGroup
+    Export:
+      Name: openboxes-demo-DbSg
