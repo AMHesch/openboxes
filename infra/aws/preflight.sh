@@ -7,8 +7,14 @@ expected_account=077510937834
 data_stack=openboxes-demo-data
 network_template="${NETWORK_TEMPLATE:-$script_dir/network.yaml}"
 data_template="${DATA_TEMPLATE:-$script_dir/data.yaml}"
+app_template="${APP_TEMPLATE:-$script_dir/app.yaml}"
 cfn_lint="${CFN_LINT:-cfn-lint}"
 jq_bin="${JQ:-jq}"
+templates=("$network_template" "$data_template")
+
+if [[ -f "$app_template" ]]; then
+  templates+=("$app_template")
+fi
 
 for tool in aws "$cfn_lint" "$jq_bin" awk sort mktemp; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -17,7 +23,7 @@ for tool in aws "$cfn_lint" "$jq_bin" awk sort mktemp; do
   fi
 done
 
-for template in "$network_template" "$data_template"; do
+for template in "${templates[@]}"; do
   if [[ ! -f "$template" ]]; then
     printf 'Template not found: %s\n' "$template" >&2
     exit 1
@@ -53,8 +59,9 @@ resource_types() {
 
 mapfile -t types < <(
   {
-    resource_types "$network_template"
-    resource_types "$data_template"
+    for template in "${templates[@]}"; do
+      resource_types "$template"
+    done
   } | sort -u
 )
 
@@ -77,24 +84,14 @@ for type in "${types[@]}"; do
   fi
 done
 
-printf 'Linting both templates with %s registry schemas.\n' "${#types[@]}"
+printf 'Linting %s templates with %s registry schemas.\n' "${#templates[@]}" "${#types[@]}"
 "$cfn_lint" \
   --config-file "$script_dir/.cfnlintrc" \
   --regions "$region" \
   --registry-schemas "$schema_directory" \
   --ignore-checks E1020 E6101 E1041 W3010 \
   --template \
-  "$network_template" \
-  "$data_template"
-
-is_access_denied() {
-  local message
-  message="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-  [[ "$message" == *accessdenied* ||
-    "$message" == *"access denied"* ||
-    "$message" == *"not authorized"* ||
-    "$message" == *unauthorizedoperation* ]]
-}
+  "${templates[@]}"
 
 ecs_cli() {
   local name="$1"
@@ -107,12 +104,6 @@ ecs_cli() {
     return 0
   else
     exit_code=$?
-  fi
-
-  if is_access_denied "$(cat "$stderr_file")"; then
-    printf 'ECS preflight skipped: IAM denied %s.\n' "$name" >&2
-    cat "$stderr_file" >&2
-    return 77
   fi
 
   cat "$stderr_file" >&2
@@ -137,11 +128,6 @@ run_ecs_preflight() {
       printf 'ECS registration preflight skipped: %s has not been deployed yet.\n' "$data_stack"
       return 0
     fi
-    if is_access_denied "$describe_error"; then
-      printf 'ECS registration preflight skipped: IAM denied reading %s outputs.\n' "$data_stack" >&2
-      printf '%s\n' "$describe_error" >&2
-      return 0
-    fi
     printf '%s\n' "$describe_error" >&2
     return 1
   fi
@@ -160,9 +146,6 @@ run_ecs_preflight() {
     :
   else
     status=$?
-    if [[ "$status" -eq 77 ]]; then
-      return 0
-    fi
     return "$status"
   fi
 
@@ -197,9 +180,6 @@ run_ecs_preflight() {
     :
   else
     status=$?
-    if [[ "$status" -eq 77 ]]; then
-      return 0
-    fi
     return "$status"
   fi
 
@@ -219,9 +199,6 @@ run_ecs_preflight() {
     :
   else
     status=$?
-    if [[ "$status" -eq 77 ]]; then
-      return 0
-    fi
     return "$status"
   fi
 
@@ -233,9 +210,6 @@ run_ecs_preflight() {
     :
   else
     status=$?
-    if [[ "$status" -eq 77 ]]; then
-      return 0
-    fi
     return "$status"
   fi
 
@@ -250,3 +224,130 @@ run_ecs_preflight() {
 }
 
 run_ecs_preflight
+
+run_app_ecs_preflight() {
+  local app_image_uri="${APP_IMAGE_URI:-}"
+  local task_definition_arn
+  local db_endpoint
+  local app_secret_arn
+  local file_system_arn
+  local access_point_arn
+  local execution_role_arn
+  local registered_task_arn
+
+  if [[ -z "$app_image_uri" ]]; then
+    echo 'App ECS registration preflight skipped: APP_IMAGE_URI is not set.'
+    return 0
+  fi
+
+  task_definition_arn="$(aws cloudformation describe-stacks \
+    --stack-name "$data_stack" \
+    --region "$region" \
+    --query "Stacks[0].Outputs[?OutputKey=='DbInitTaskDefinition'].OutputValue | [0]" \
+    --output text)"
+  db_endpoint="$(aws cloudformation describe-stacks \
+    --stack-name "$data_stack" \
+    --region "$region" \
+    --query "Stacks[0].Outputs[?OutputKey=='DbEndpoint'].OutputValue | [0]" \
+    --output text)"
+  app_secret_arn="$(aws cloudformation describe-stacks \
+    --stack-name "$data_stack" \
+    --region "$region" \
+    --query "Stacks[0].Outputs[?OutputKey=='AppSecretArn'].OutputValue | [0]" \
+    --output text)"
+  file_system_arn="$(aws cloudformation describe-stacks \
+    --stack-name "$data_stack" \
+    --region "$region" \
+    --query "Stacks[0].Outputs[?OutputKey=='FileSystemArn'].OutputValue | [0]" \
+    --output text)"
+  access_point_arn="$(aws cloudformation describe-stacks \
+    --stack-name "$data_stack" \
+    --region "$region" \
+    --query "Stacks[0].Outputs[?OutputKey=='AccessPointArn'].OutputValue | [0]" \
+    --output text)"
+  execution_role_arn="$(aws ecs describe-task-definition \
+    --task-definition "$task_definition_arn" \
+    --region "$region" \
+    --query 'taskDefinition.executionRoleArn' \
+    --output text)"
+
+  for value_name in task_definition_arn db_endpoint app_secret_arn file_system_arn access_point_arn execution_role_arn; do
+    if [[ -z "${!value_name}" || "${!value_name}" == None ]]; then
+      printf 'Missing required app preflight value: %s\n' "$value_name" >&2
+      return 1
+    fi
+  done
+  if [[ ! "$app_image_uri" =~ @sha256:[[:xdigit:]]{64}$ ]]; then
+    printf 'APP_IMAGE_URI must be an ECR digest URI: %s\n' "$app_image_uri" >&2
+    return 1
+  fi
+
+  # shellcheck disable=SC2016
+  "$jq_bin" -n \
+    --arg image "$app_image_uri" \
+    --arg role "$execution_role_arn" \
+    --arg endpoint "$db_endpoint" \
+    --arg app_secret "$app_secret_arn" \
+    --arg file_system "$file_system_arn" \
+    --arg access_point "$access_point_arn" \
+    '{
+      family: "openboxes-demo-preflight-app",
+      taskRoleArn: $role,
+      executionRoleArn: $role,
+      networkMode: "awsvpc",
+      requiresCompatibilities: ["FARGATE"],
+      cpu: "1024",
+      memory: "4096",
+      runtimePlatform: {cpuArchitecture: "X86_64", operatingSystemFamily: "LINUX"},
+      containerDefinitions: [{
+        name: "openboxes",
+        image: $image,
+        essential: true,
+        portMappings: [{containerPort: 8080, protocol: "tcp"}],
+        environment: [
+          {name: "DATASOURCE_URL", value: ("jdbc:mysql://" + $endpoint + ":3306/openboxes?serverTimezone=UTC&sslMode=VERIFY_IDENTITY&trustCertificateKeyStoreUrl=file:/app/rds-ca.p12&trustCertificateKeyStoreType=PKCS12&trustCertificateKeyStorePassword=changeit")},
+          {name: "DATASOURCE_USERNAME", value: "openboxes"},
+          {name: "GRAILS_SERVER_URL", value: "https://preflight.invalid/openboxes"}
+        ],
+        secrets: [{name: "DATASOURCE_PASSWORD", valueFrom: ($app_secret + ":password::")}],
+        mountPoints: [{sourceVolume: "uploads", containerPath: "/app/uploads", readOnly: false}]
+      }],
+      volumes: [{
+        name: "uploads",
+        s3filesVolumeConfiguration: {
+          fileSystemArn: $file_system,
+          accessPointArn: $access_point
+        }
+      }]
+    }' > "$temporary_directory/register-app-task-definition.json"
+
+  aws ecs register-task-definition \
+    --cli-input-json "file://$temporary_directory/register-app-task-definition.json" \
+    --region "$region" \
+    --output json > "$temporary_directory/register-app-task-definition.json.response"
+  registered_task_arn="$("$jq_bin" -r '.taskDefinition.taskDefinitionArn // empty' \
+    "$temporary_directory/register-app-task-definition.json.response")"
+  if [[ -z "$registered_task_arn" ]]; then
+    echo 'ECS did not return the app preflight task definition ARN.' >&2
+    return 1
+  fi
+
+  printf 'Registered temporary app ECS task definition: %s\n' "$registered_task_arn"
+  aws ecs deregister-task-definition \
+    --task-definition "$registered_task_arn" \
+    --region "$region" \
+    --output json > "$temporary_directory/deregister-app-task-definition.json"
+  aws ecs delete-task-definitions \
+    --task-definitions "$registered_task_arn" \
+    --region "$region" \
+    --output json > "$temporary_directory/delete-app-task-definition.json"
+  if ! "$jq_bin" -e '.failures | length == 0' \
+    "$temporary_directory/delete-app-task-definition.json" >/dev/null; then
+    echo 'ECS did not delete the temporary app task definition cleanly.' >&2
+    cat "$temporary_directory/delete-app-task-definition.json" >&2
+    return 1
+  fi
+  printf 'Deleted temporary app ECS task definition: %s\n' "$registered_task_arn"
+}
+
+run_app_ecs_preflight
