@@ -11,6 +11,8 @@ region=us-east-1
 expected_account=077510937834
 network_stack=openboxes-demo-network
 data_stack=openboxes-demo-data
+app_stack=openboxes-demo-app
+observability_stack=openboxes-demo-observability
 database_identifier=openboxes-demo-db
 ecr_repository=openboxes-demo
 
@@ -58,14 +60,72 @@ delete_stack_if_present() {
   fi
 }
 
+delete_secret_if_present() {
+  local secret_id="$1"
+  local secret_info
+  if secret_info="$(aws secretsmanager describe-secret \
+    --secret-id "$secret_id" \
+    --region "$region" \
+    --output json 2>&1)"; then
+    printf 'Deleting stack-owned secret %s\n' "$secret_id"
+    run_capture aws secretsmanager delete-secret \
+      --secret-id "$secret_id" \
+      --force-delete-without-recovery \
+      --region "$region"
+  elif [[ "$secret_info" == *'ResourceNotFoundException'* || "$secret_info" == *'not found'* ]]; then
+    printf 'Secret %s does not exist; skipping\n' "$secret_id"
+  else
+    printf '%s\n' "$secret_info" >&2
+    return 1
+  fi
+}
+
+empty_alb_log_bucket_if_present() {
+  local bucket="$1"
+  local output
+  if output="$(aws s3api head-bucket --bucket "$bucket" --region "$region" 2>&1)"; then
+    run_capture aws s3 rm "s3://${bucket}" --recursive --region "$region"
+  elif [[ "$output" == *'(404)'* || "$output" == *'NoSuchBucket'* || "$output" == *'Not Found'* ]]; then
+    printf 'Bucket %s does not exist; skipping\n' "$bucket"
+  else
+    printf '%s\n' "$output" >&2
+    return 1
+  fi
+}
+
+delete_log_group_if_present() {
+  local log_group="$1"
+  local output
+  print_command aws logs delete-log-group --log-group-name "$log_group" --region "$region"
+  if output="$(aws logs delete-log-group --log-group-name "$log_group" --region "$region" 2>&1)"; then
+    printf 'Deleted log group %s\n' "$log_group"
+  elif [[ "$output" == *'ResourceNotFoundException'* ]]; then
+    printf 'Log group %s does not exist; skipping\n' "$log_group"
+  else
+    printf '%s\n' "$output" >&2
+    return 1
+  fi
+}
+
 account="$(run_capture aws sts get-caller-identity --region "$region" --query Account --output text)"
 if [[ "$account" != "$expected_account" ]]; then
   printf 'Refusing cleanup in account %s; expected %s\n' "$account" "$expected_account" >&2
   exit 1
 fi
 
-delete_stack_if_present openboxes-demo-observability
-delete_stack_if_present openboxes-demo-app
+delete_stack_if_present "$observability_stack"
+delete_secret_if_present openboxes-demo/devin-webhook
+if stack_exists "$app_stack"; then
+  empty_alb_log_bucket_if_present "openboxes-demo-alb-logs-${account}"
+else
+  status=$?
+  if [[ "$status" -eq 1 ]]; then
+    printf 'App stack %s does not exist; skipping ALB log bucket cleanup\n' "$app_stack"
+  else
+    exit "$status"
+  fi
+fi
+delete_stack_if_present "$app_stack"
 
 if stack_exists "$data_stack"; then
   printf 'Disabling RDS deletion protection for %s\n' "$database_identifier"
@@ -198,6 +258,10 @@ else
     exit "$status"
   fi
 fi
+
+delete_log_group_if_present /aws/rds/instance/openboxes-demo-db/error
+delete_log_group_if_present /aws/rds/instance/openboxes-demo-db/slowquery
+delete_log_group_if_present /aws/ecs/containerinsights/openboxes-demo/performance
 
 delete_stack_if_present "$network_stack"
 

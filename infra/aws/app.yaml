@@ -225,10 +225,10 @@ Resources:
           HealthCheck:
             Command:
               - CMD-SHELL
-              - curl -fs http://localhost:8080/openboxes/health | grep -q UP || exit 1
+              - curl -fsS --max-time 8 http://127.0.0.1:8080/openboxes/health | grep -q UP || exit 1
             Interval: 30
-            Timeout: 5
-            Retries: 3
+            Timeout: 10
+            Retries: 5
             StartPeriod: 300
           LogConfiguration:
             LogDriver: awslogs

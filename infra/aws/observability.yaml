@@ -1,0 +1,996 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: OpenBoxes observability, synthetic login probe, incident drill, and investigator access
+
+Parameters:
+  AppUrl:
+    Type: String
+    Description: Public OpenBoxes URL including the /openboxes path
+  AlbFullName:
+    Type: String
+    Description: Application Load Balancer dimension value, app/name/id
+  TargetGroupFullName:
+    Type: String
+    Description: Target group dimension value, targetgroup/name/id
+  LocationId:
+    Type: String
+    Description: Main Warehouse location id used by the login probe
+  WebhookUrl:
+    Type: String
+    Default: ''
+    Description: Optional Devin incident webhook endpoint
+  ProbeState:
+    Type: String
+    Default: ENABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+    Description: State of the one-minute login probe schedule
+
+Conditions:
+  HasWebhook: !Not [!Equals [!Ref WebhookUrl, '']]
+
+Resources:
+  ProbeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /openboxes-demo/probe
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  ProbeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: openboxes-demo-probe-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: openboxes-demo-probe-runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteProbeLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/openboxes-demo/probe:log-stream:*
+              - Sid: ReadAdminSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:openboxes-demo/admin-ui-*
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-probe-role
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  ProbeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: openboxes-demo-login-probe
+      Description: Synthetic OpenBoxes login and location-selection probe
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 75
+      MemorySize: 128
+      Role: !GetAtt ProbeRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref ProbeLogGroup
+      Environment:
+        Variables:
+          APP_URL: !Ref AppUrl
+          LOCATION_ID: !Ref LocationId
+          ADMIN_SECRET_ID: openboxes-demo/admin-ui
+      Code:
+        ZipFile: |
+          import http.cookiejar
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from html.parser import HTMLParser
+
+          import boto3
+
+
+          class LoginFormParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.action = None
+                  self.inputs = {}
+                  self.in_form = False
+
+              def handle_starttag(self, tag, attrs):
+                  attributes = dict(attrs)
+                  if tag == "form" and self.action is None:
+                      self.action = attributes.get("action", "")
+                      self.in_form = True
+                  elif tag == "input" and self.in_form:
+                      name = attributes.get("name")
+                      if name:
+                          self.inputs[name] = attributes.get("value", "")
+
+              def handle_endtag(self, tag):
+                  if tag == "form" and self.in_form:
+                      self.in_form = False
+
+
+          def request(opener, url, data=None):
+              request_headers = {"User-Agent": "openboxes-demo-login-probe/1"}
+              request_object = urllib.request.Request(url, data=data, headers=request_headers)
+              try:
+                  with opener.open(request_object, timeout=60) as response:
+                      return response.status, response.geturl(), response.read()
+              except urllib.error.HTTPError as error:
+                  return error.code, error.geturl(), error.read()
+
+
+          def secret_value(secret):
+              value = secret.get("SecretString", "")
+              if not value:
+                  raise RuntimeError("admin secret has no SecretString")
+              try:
+                  decoded = json.loads(value)
+              except json.JSONDecodeError:
+                  return value
+              if isinstance(decoded, dict) and "password" in decoded:
+                  return str(decoded["password"])
+              return value
+
+
+          def handler(event, context):
+              started = time.monotonic()
+              failed_step = None
+              http_status = None
+              error = None
+              success = 0
+              try:
+                  app_url = os.environ["APP_URL"].rstrip("/")
+                  location_id = os.environ["LOCATION_ID"]
+                  secret_id = os.environ["ADMIN_SECRET_ID"]
+                  password = secret_value(
+                      boto3.client("secretsmanager").get_secret_value(SecretId=secret_id)
+                  )
+                  opener = urllib.request.build_opener(
+                      urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+                  )
+
+                  failed_step = "login_page"
+                  login_status, login_url, login_body = request(
+                      opener, app_url + "/auth/login"
+                  )
+                  http_status = login_status
+                  if login_status != 200:
+                      raise RuntimeError("login page returned non-200")
+
+                  parser = LoginFormParser()
+                  parser.feed(login_body.decode("utf-8", "replace"))
+                  if not parser.action:
+                      raise RuntimeError("login form action missing")
+                  fields = dict(parser.inputs)
+                  fields["username"] = "admin"
+                  fields["password"] = password
+                  fields.setdefault("browserTimezone", "UTC")
+                  login_action = urllib.parse.urljoin(login_url, parser.action)
+
+                  failed_step = "login_post"
+                  post_status, post_url, post_body = request(
+                      opener,
+                      login_action,
+                      urllib.parse.urlencode(fields).encode("utf-8"),
+                  )
+                  http_status = post_status
+                  if post_status != 200:
+                      raise RuntimeError("login post returned non-200")
+                  if b'id="loginButton"' in post_body:
+                      raise RuntimeError("login form remained after login post")
+
+                  failed_step = "choose_location"
+                  choose_url = (
+                      app_url
+                      + "/dashboard/chooseLocation/"
+                      + urllib.parse.quote(location_id, safe="")
+                      + "?targetUri="
+                  )
+                  choose_status, choose_final_url, choose_body = request(
+                      opener, choose_url
+                  )
+                  http_status = choose_status
+                  if choose_status != 200:
+                      raise RuntimeError("choose location returned non-200")
+                  final_path = urllib.parse.urlsplit(choose_final_url).path.rstrip("/")
+                  app_path = urllib.parse.urlsplit(app_url).path.rstrip("/")
+                  if final_path != app_path or b'id="root"' not in choose_body:
+                      raise RuntimeError("dashboard marker missing")
+                  success = 1
+                  failed_step = None
+                  http_status = 200
+              except Exception as exception:
+                  error = str(exception).replace("\n", " ")[:160]
+
+              latency_ms = int((time.monotonic() - started) * 1000)
+              outcome = "success" if success else "failure"
+              payload = {
+                  "_aws": {
+                      "Timestamp": int(time.time() * 1000),
+                      "CloudWatchMetrics": [
+                          {
+                              "Namespace": "OpenBoxesDemo/Probe",
+                              "Dimensions": [["Probe"]],
+                              "Metrics": [
+                                  {"Name": "LoginSuccess", "Unit": "Count"},
+                                  {"Name": "LoginFailure", "Unit": "Count"},
+                                  {"Name": "LoginLatencyMs", "Unit": "Milliseconds"},
+                              ],
+                          }
+                      ],
+                  },
+                  "Probe": "login",
+                  "LoginSuccess": success,
+                  "LoginFailure": 0 if success else 1,
+                  "LoginLatencyMs": latency_ms,
+                  "event": "login_probe",
+                  "outcome": outcome,
+                  "failed_step": failed_step,
+                  "http_status": http_status,
+                  "error": error,
+                  "request_id": context.aws_request_id,
+              }
+              print(json.dumps(payload, separators=(",", ":")))
+              return {"outcome": outcome}
+
+  ProbeSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: openboxes-demo-probe-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: openboxes-demo-probe-scheduler
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ProbeFunction.Arn
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-probe-scheduler-role
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  ProbeSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: openboxes-demo-login-probe
+      Description: Invoke the OpenBoxes synthetic login probe every minute
+      ScheduleExpression: rate(1 minute)
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: !Ref ProbeState
+      Target:
+        Arn: !GetAtt ProbeFunction.Arn
+        RoleArn: !GetAtt ProbeSchedulerRole.Arn
+        Input: '{}'
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+
+  AppLockWaitMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: /openboxes-demo/app
+      FilterPattern: '"Lock wait timeout exceeded"'
+      MetricTransformations:
+        - MetricName: LockWaitTimeouts
+          MetricNamespace: OpenBoxesDemo/App
+          MetricValue: '1'
+          DefaultValue: 0
+
+  AppErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: /openboxes-demo/app
+      FilterPattern: '" ERROR "'
+      MetricTransformations:
+        - MetricName: AppErrorLines
+          MetricNamespace: OpenBoxesDemo/App
+          MetricValue: '1'
+          DefaultValue: 0
+
+  ProbeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: openboxes-demo-login-probe-failing
+      AlarmDescription: 'Synthetic login probe failing via CloudFront. Runbook: https://github.com/AMHesch/openboxes/blob/devin/1790664063-aws-observability/infra/aws/README.md#observability-and-incident-drill'
+      Namespace: OpenBoxesDemo/Probe
+      MetricName: LoginFailure
+      Dimensions:
+        - Name: Probe
+          Value: login
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  LockWaitAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: openboxes-demo-lock-wait-timeouts
+      AlarmDescription: OpenBoxes database lock wait timeout detected
+      Namespace: OpenBoxesDemo/App
+      MetricName: LockWaitTimeouts
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: openboxes-demo-alb-target-5xx
+      AlarmDescription: Application load balancer target 5xx responses detected
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref AlbFullName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  NoHealthyTargetAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: openboxes-demo-no-healthy-target
+      AlarmDescription: OpenBoxes application has no healthy load balancer target
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref AlbFullName
+        - Name: TargetGroup
+          Value: !Ref TargetGroupFullName
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  ProbeSlowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: openboxes-demo-login-probe-slow
+      AlarmDescription: Synthetic login probe latency is elevated
+      Namespace: OpenBoxesDemo/Probe
+      MetricName: LoginLatencyMs
+      Dimensions:
+        - Name: Probe
+          Value: login
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 10000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  AppErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: openboxes-demo-app-errors
+      AlarmDescription: OpenBoxes application error lines detected
+      Namespace: OpenBoxesDemo/App
+      MetricName: AppErrorLines
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  UserImpactAlarm:
+    Type: AWS::CloudWatch::CompositeAlarm
+    Properties:
+      AlarmName: openboxes-demo-user-impact
+      AlarmDescription: Composite alarm routed to Devin when any OpenBoxes demo child alarm is in ALARM
+      AlarmRule: !Sub >-
+        ALARM("${ProbeAlarm.Arn}") OR ALARM("${ProbeSlowAlarm.Arn}") OR
+        ALARM("${LockWaitAlarm.Arn}") OR ALARM("${AppErrorsAlarm.Arn}") OR
+        ALARM("${Alb5xxAlarm.Arn}") OR ALARM("${NoHealthyTargetAlarm.Arn}")
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: openboxes-demo
+      DashboardBody:
+        Fn::Sub:
+          - |
+            {
+              "widgets": [
+                {
+                  "type": "alarm",
+                  "x": 0,
+                  "y": 0,
+                  "width": 24,
+                  "height": 6,
+                  "properties": {
+                    "title": "OpenBoxes alarms",
+                    "alarms": ["${ProbeAlarmArn}", "${ProbeSlowAlarmArn}", "${LockAlarmArn}", "${AppErrorsAlarmArn}", "${Alb5xxAlarmArn}", "${NoHealthyTargetAlarmArn}", "${UserImpactAlarmArn}"],
+                    "view": "timeSeries",
+                    "region": "${AWS::Region}"
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 6,
+                  "width": 12,
+                  "height": 6,
+                  "properties": {
+                    "title": "Login probe",
+                    "view": "timeSeries",
+                    "region": "${AWS::Region}",
+                    "period": 60,
+                    "stat": "Sum",
+                    "metrics": [
+                      ["OpenBoxesDemo/Probe", "LoginSuccess", "Probe", "login"],
+                      [".", "LoginFailure", ".", "."],
+                      ["AWS/Lambda", "Errors", "FunctionName", "openboxes-demo-login-probe"]
+                    ]
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 12,
+                  "y": 6,
+                  "width": 12,
+                  "height": 6,
+                  "properties": {
+                    "title": "Login latency",
+                    "view": "timeSeries",
+                    "region": "${AWS::Region}",
+                    "period": 60,
+                    "stat": "Maximum",
+                    "metrics": [
+                      ["OpenBoxesDemo/Probe", "LoginLatencyMs", "Probe", "login"]
+                    ]
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 12,
+                  "width": 12,
+                  "height": 6,
+                  "properties": {
+                    "title": "Application errors and lock waits",
+                    "view": "timeSeries",
+                    "region": "${AWS::Region}",
+                    "period": 60,
+                    "stat": "Sum",
+                    "metrics": [
+                      ["OpenBoxesDemo/App", "LockWaitTimeouts"],
+                      [".", "AppErrorLines"]
+                    ]
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 12,
+                  "y": 12,
+                  "width": 12,
+                  "height": 6,
+                  "properties": {
+                    "title": "Application load balancer",
+                    "view": "timeSeries",
+                    "region": "${AWS::Region}",
+                    "period": 60,
+                    "metrics": [
+                      ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${AlbFullName}", {"stat": "Sum"}],
+                      [".", "HTTPCode_Target_5XX_Count", ".", ".", {"stat": "Sum"}],
+                      [".", "TargetResponseTime", ".", ".", {"stat": "p95"}]
+                    ]
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 18,
+                  "width": 8,
+                  "height": 6,
+                  "properties": {
+                    "title": "ECS CPU and memory",
+                    "view": "timeSeries",
+                    "region": "${AWS::Region}",
+                    "period": 60,
+                    "metrics": [
+                      ["AWS/ECS", "CPUUtilization", "ClusterName", "openboxes-demo", "ServiceName", "openboxes-demo-app"],
+                      [".", "MemoryUtilization", ".", ".", ".", "."]
+                    ]
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 8,
+                  "y": 18,
+                  "width": 8,
+                  "height": 6,
+                  "properties": {
+                    "title": "RDS health",
+                    "view": "timeSeries",
+                    "region": "${AWS::Region}",
+                    "period": 60,
+                    "metrics": [
+                      ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "openboxes-demo-db"],
+                      [".", "DatabaseConnections", ".", "."],
+                      [".", "FreeableMemory", ".", "."]
+                    ]
+                  }
+                },
+                {
+                  "type": "log",
+                  "x": 16,
+                  "y": 18,
+                  "width": 8,
+                  "height": 6,
+                  "properties": {
+                    "title": "Application incident log lines",
+                    "view": "table",
+                    "region": "${AWS::Region}",
+                    "query": "SOURCE '${AppLogGroup}' | fields @timestamp, @message | filter @message like /Lock wait timeout|ERROR/ | sort @timestamp desc | limit 20"
+                  }
+                },
+                {
+                  "type": "log",
+                  "x": 0,
+                  "y": 24,
+                  "width": 24,
+                  "height": 6,
+                  "properties": {
+                    "title": "Incident drill events",
+                    "view": "table",
+                    "region": "${AWS::Region}",
+                    "query": "SOURCE '${DbInitLogGroup}' | fields @timestamp, @message | filter @message like /incident_drill/ | sort @timestamp desc | limit 20"
+                  }
+                }
+              ]
+            }
+          - ProbeAlarmArn: !GetAtt ProbeAlarm.Arn
+            ProbeSlowAlarmArn: !GetAtt ProbeSlowAlarm.Arn
+            LockAlarmArn: !GetAtt LockWaitAlarm.Arn
+            AppErrorsAlarmArn: !GetAtt AppErrorsAlarm.Arn
+            Alb5xxAlarmArn: !GetAtt Alb5xxAlarm.Arn
+            NoHealthyTargetAlarmArn: !GetAtt NoHealthyTargetAlarm.Arn
+            UserImpactAlarmArn: !GetAtt UserImpactAlarm.Arn
+            AppLogGroup: /openboxes-demo/app
+            DbInitLogGroup: /openboxes-demo/db-init
+
+  DevinWebhookConnection:
+    Type: AWS::Events::Connection
+    Condition: HasWebhook
+    Properties:
+      Name: openboxes-demo-devin-webhook
+      AuthorizationType: API_KEY
+      AuthParameters:
+        ApiKeyAuthParameters:
+          ApiKeyName: X-Webhook-Secret
+          ApiKeyValue: '{{resolve:secretsmanager:openboxes-demo/devin-webhook:SecretString}}'
+
+  DevinWebhookDestination:
+    Type: AWS::Events::ApiDestination
+    Condition: HasWebhook
+    Properties:
+      Name: openboxes-demo-devin-webhook
+      ConnectionArn: !GetAtt DevinWebhookConnection.Arn
+      InvocationEndpoint: !Ref WebhookUrl
+      HttpMethod: POST
+      InvocationRateLimitPerSecond: 1
+
+  IncidentDlq:
+    Type: AWS::SQS::Queue
+    Condition: HasWebhook
+    Properties:
+      QueueName: openboxes-demo-incident-dlq
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  IncidentDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Condition: HasWebhook
+    Properties:
+      Queues:
+        - !Ref IncidentDlq
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeToUseDlq
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt IncidentDlq.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt AlarmToDevinRule.Arn
+
+  EventsWebhookRole:
+    Type: AWS::IAM::Role
+    Condition: HasWebhook
+    Properties:
+      RoleName: openboxes-demo-events-webhook-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: openboxes-demo-events-webhook
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:InvokeApiDestination
+                Resource: !GetAtt DevinWebhookDestination.Arn
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-events-webhook-role
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  AlarmToDevinRule:
+    Type: AWS::Events::Rule
+    Condition: HasWebhook
+    Properties:
+      Name: openboxes-demo-alarm-to-devin
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        resources:
+          - !GetAtt UserImpactAlarm.Arn
+        detail:
+          state:
+            value:
+              - ALARM
+      Targets:
+        - Id: DevinWebhook
+          Arn: !GetAtt DevinWebhookDestination.Arn
+          RoleArn: !GetAtt EventsWebhookRole.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt IncidentDlq.Arn
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  InvestigatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: openboxes-demo-investigator
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::077510937834:role/devin-sessions
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: openboxes-demo-investigator-read-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchRead
+                Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:DescribeAlarmHistory
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:GetDashboard
+                  - cloudwatch:ListDashboards
+                Resource: '*'
+              - Sid: Ec2NetworkRead
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSecurityGroupRules
+                  - ec2:DescribeNetworkInterfaces
+                Resource: '*'
+              - Sid: LogsDescribe
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              - Sid: LogsRead
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogStreams
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                  - logs:StartQuery
+                  - logs:GetQueryResults
+                  - logs:StopQuery
+                  - logs:DescribeQueries
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/openboxes-demo/app
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/openboxes-demo/app:*
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/openboxes-demo/probe
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/openboxes-demo/probe:*
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/openboxes-demo/db-init
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/openboxes-demo/db-init:*
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/instance/openboxes-demo-db/error
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/instance/openboxes-demo-db/error:*
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/instance/openboxes-demo-db/slowquery
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/instance/openboxes-demo-db/slowquery:*
+              - Sid: EcsRead
+                Effect: Allow
+                Action:
+                  - ecs:Describe*
+                  - ecs:List*
+                Resource: '*'
+              - Sid: RdsRead
+                Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBLogFiles
+                  - rds:DownloadDBLogFilePortion
+                  - rds:DescribeEvents
+                  - rds:DescribeDBParameters
+                Resource: '*'
+              - Sid: AlbRead
+                Effect: Allow
+                Action:
+                  - elasticloadbalancing:Describe*
+                Resource: '*'
+              - Sid: CloudTrailRead
+                Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                Resource: '*'
+              - Sid: EventsRead
+                Effect: Allow
+                Action:
+                  - events:DescribeRule
+                  - events:ListRules
+                  - events:ListTargetsByRule
+                Resource: '*'
+              - Sid: SchedulerRead
+                Effect: Allow
+                Action:
+                  - scheduler:GetSchedule
+                Resource: !GetAtt ProbeSchedule.Arn
+              - Sid: ProbeConfigurationRead
+                Effect: Allow
+                Action:
+                  - lambda:GetFunctionConfiguration
+                Resource: !GetAtt ProbeFunction.Arn
+      Tags:
+        - Key: Name
+          Value: openboxes-demo-investigator
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+Outputs:
+  DashboardUrl:
+    Description: CloudWatch dashboard URL
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=openboxes-demo
+  ProbeFunctionName:
+    Description: Login probe Lambda function name
+    Value: !Ref ProbeFunction
+  InvestigatorRoleArn:
+    Description: Read-only investigator role ARN
+    Value: !GetAtt InvestigatorRole.Arn
+  RoutedAlarmArn:
+    Description: Alarm routed when webhook wiring is enabled
+    Value: !GetAtt UserImpactAlarm.Arn
+  RuleArn:
+    Condition: HasWebhook
+    Description: EventBridge alarm-to-Devin rule ARN
+    Value: !GetAtt AlarmToDevinRule.Arn
+  DlqUrl:
+    Condition: HasWebhook
+    Description: EventBridge webhook dead-letter queue URL
+    Value: !Ref IncidentDlq
