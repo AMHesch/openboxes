@@ -17,7 +17,8 @@ Browser --HTTPS--> CloudFront (dzyqgt7ow5g6a.cloudfront.net)
                |--NFS/TLS 2049--> S3 Files mount at /app/uploads --> versioned, SSE-S3 uploads bucket
                '--HTTPS 443--> ECR, Secrets Manager, CloudWatch Logs
 Lambda login probe (every minute) --> CloudWatch metrics/alarms/dashboard
-    alarm openboxes-demo-login-probe-failing (ALARM only) --> EventBridge --> Devin automation webhook --> read-only investigator role
+    composite alarm openboxes-demo-user-impact (ALARM when any child is ALARM) --> EventBridge --> Devin automation webhook --> read-only investigator role
+    children: openboxes-demo-login-probe-failing, openboxes-demo-login-probe-slow, openboxes-demo-lock-wait-timeouts, openboxes-demo-app-errors, openboxes-demo-alb-target-5xx, openboxes-demo-no-healthy-target
 ```
 
 Stacks: `openboxes-demo-network`, `openboxes-demo-data`, `openboxes-demo-app`, `openboxes-demo-observability`. PRs: AMHesch/openboxes #1 (journey), #2 (network and data), #3 (app and migration), #4 (observability, drill, and investigator). Incident issues go to the private AMHesch/cognition-demo repository, never the public fork.
@@ -31,15 +32,16 @@ Do all of this at least 30 minutes before the meeting.
 3. **Health check:**
    ```bash
    aws cloudwatch describe-alarms --alarm-name-prefix openboxes-demo- --query 'MetricAlarms[].[AlarmName,StateValue]' --output text   # all OK
+   aws cloudwatch describe-alarms --alarm-names openboxes-demo-user-impact --alarm-types CompositeAlarm --query 'CompositeAlarms[].[AlarmName,StateValue]' --output text   # OK
    aws ecs describe-services --cluster openboxes-demo --services openboxes-demo-app --query 'services[0].[runningCount,deployments[0].rolloutState]'   # 1, COMPLETED
    ./infra/aws/drill.sh status   # no drill running
    curl -s https://dzyqgt7ow5g6a.cloudfront.net/openboxes/health   # {"status":"UP"}
    ```
-4. **Close the open incident issue** in AMHesch/cognition-demo if you want the demo to create a fresh issue. While an issue for the alarm is open, a new event becomes a comment on it instead.
+4. **Close the open incident issue** in AMHesch/cognition-demo if you want the demo to create a fresh issue. While an issue for the same `incidentKey` is open, a new event becomes a comment on it instead.
 5. **Open these tabs:**
    - The app (admin password is in Secrets Manager `openboxes-demo/admin-ui`; do not show it on screen).
    - The CloudWatch dashboard `openboxes-demo`.
-   - The alarm `openboxes-demo-login-probe-failing`.
+   - The composite alarm `openboxes-demo-user-impact`.
    - Devin sessions filtered by the tag `incident`.
    - AMHesch/cognition-demo issues.
    - PR #4.
@@ -56,22 +58,34 @@ Start the drill at the beginning of the talk, so the investigation is ready by t
 | --- | --- | --- |
 | 0:00 | Drill task starts: one-shot Fargate task, `SELECT ... FOR UPDATE` on the `admin` user row | Migration story, PRs, smoke-test video |
 | ~1:30 | First probe failure: `choose_location` returns HTTP 500 after about 51 s; `/health` stays UP | Dashboard: login failures and lock waits rising, health still green |
-| ~3:00 | `openboxes-demo-lock-wait-timeouts` goes to ALARM | |
-| ~3:45 | `openboxes-demo-login-probe-failing` goes to ALARM; EventBridge invokes the Devin webhook | The alarm and its routing rule |
+| ~3:00 | `openboxes-demo-lock-wait-timeouts` goes to ALARM; `openboxes-demo-user-impact` enters ALARM and EventBridge invokes the Devin webhook | The composite alarm and its routing rule |
+| ~3:45 | `openboxes-demo-login-probe-failing` goes to ALARM; the composite remains ALARM and does not send a second notification | The child alarm |
 | ~5:00 | The Devin session assumes `openboxes-demo-investigator` (read-only) | The live Devin session |
 | ~9:30 | Issue or comment in AMHesch/cognition-demo: cause, evidence vs inference, confidence, mitigation command | The issue |
 | ~10:00 | **Human approval:** the presenter reads the recommendation and runs `./infra/aws/drill.sh stop` | The approval moment |
 | ~10:35 | Next probe succeeds | Dashboard |
-| ~13:00 | Both alarms back to OK; verify read-only and post `Recovery verified <UTC>` on the issue | Alarm and issue |
+| ~13:00 | All child alarms and the composite back to OK; verify read-only and post `Recovery verified <UTC>` on the issue | Alarm and issue |
 
 A 900 s drill ends on its own at about T+15:00. With 600 s, the drill expired before the approval step in rehearsal, so use 900 s for the live demo.
 
 **Recovery verification** is read-only:
 
 ```bash
-aws cloudwatch describe-alarms --alarm-names openboxes-demo-login-probe-failing openboxes-demo-lock-wait-timeouts --query 'MetricAlarms[].[AlarmName,StateValue,StateUpdatedTimestamp]' --output text
+aws cloudwatch describe-alarms --alarm-names openboxes-demo-login-probe-failing openboxes-demo-login-probe-slow openboxes-demo-lock-wait-timeouts openboxes-demo-app-errors openboxes-demo-alb-target-5xx openboxes-demo-no-healthy-target --alarm-types MetricAlarm --query 'MetricAlarms[].[AlarmName,StateValue,StateUpdatedTimestamp]' --output text
+aws cloudwatch describe-alarms --alarm-names openboxes-demo-user-impact --alarm-types CompositeAlarm --query 'CompositeAlarms[].[AlarmName,StateValue,StateUpdatedTimestamp]' --output text
 aws logs filter-log-events --log-group-name /openboxes-demo/probe --start-time $(( ($(date +%s)-300)*1000 )) --filter-pattern '"outcome"' --query 'events[].message' --output text
 ```
+
+## Improvising other failure modes
+
+Only the lock drill is rehearsed; the other scenarios are **not rehearsed**. The composite does not re-fire until it has returned to OK, so wait for full recovery between failures. Devin automation is limited to 3 runs per hour. Each app outage is about 5–7 minutes.
+
+| Failure | Trigger command | Expected alarms | Mitigation |
+| --- | --- | --- | --- |
+| Lock drill (rehearsed) | `./infra/aws/drill.sh start --seconds 900` | lock-wait, probe-failing, app-errors, probe-slow | `./infra/aws/drill.sh stop` |
+| Kill the app task (not rehearsed) | `aws ecs stop-task --cluster openboxes-demo --task $(aws ecs list-tasks --cluster openboxes-demo --service-name openboxes-demo-app --query 'taskArns[0]' --output text)` | no-healthy-target, alb-5xx, probe-failing | None: ECS replaces it in about 5–7 min |
+| Scale to zero (not rehearsed) | `aws ecs update-service --cluster openboxes-demo --service openboxes-demo-app --desired-count 0` | no-healthy-target, probe-failing | `aws ecs update-service --cluster openboxes-demo --service openboxes-demo-app --desired-count 1` |
+| Reboot the database (not rehearsed) | `aws rds reboot-db-instance --db-instance-identifier openboxes-demo-db` | probe-failing, app-errors (may be too brief to alarm) | None: wait |
 
 ## If something goes wrong live
 
@@ -101,7 +115,7 @@ These are estimates from us-east-1 on-demand list prices. The `Project=openboxes
 | ALB, including LCUs | ~$18–22 | ~$17 |
 | Public IPv4 (ALB x2 + task) | ~$10.95 | ~$7.30 |
 | RDS db.t4g.micro, 20 GB gp3, single AZ | ~$14 | ~$14 |
-| CloudWatch: Container Insights, logs, 4 alarms, dashboard, probe metrics | ~$6–10 | ~$2–4 |
+| CloudWatch: Container Insights, logs, 7 alarms, dashboard, probe metrics | ~$6–10 | ~$2–4 |
 | 6 Secrets Manager secrets | ~$2.40 | ~$2.40 |
 | S3, S3 Files, ECR (0.6 GB), CloudFront, Lambda, Scheduler, EventBridge, SQS | ~$1–3 | ~$1 |
 | **Total** | **~$95–105 (~$3.20–3.50/day)** | **~$35–45** |

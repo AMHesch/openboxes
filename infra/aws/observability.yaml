@@ -466,6 +466,88 @@ Resources:
         - Key: DeleteAfter
           Value: '2026-10-31'
 
+  ProbeSlowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: openboxes-demo-login-probe-slow
+      AlarmDescription: Synthetic login probe latency is elevated
+      Namespace: OpenBoxesDemo/Probe
+      MetricName: LoginLatencyMs
+      Dimensions:
+        - Name: Probe
+          Value: login
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 10000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  AppErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: openboxes-demo-app-errors
+      AlarmDescription: OpenBoxes application error lines detected
+      Namespace: OpenBoxesDemo/App
+      MetricName: AppErrorLines
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
+  UserImpactAlarm:
+    Type: AWS::CloudWatch::CompositeAlarm
+    Properties:
+      AlarmName: openboxes-demo-user-impact
+      AlarmDescription: Composite alarm routed to Devin when any OpenBoxes demo child alarm is in ALARM
+      AlarmRule: !Sub >-
+        ALARM("${ProbeAlarm.Arn}") OR ALARM("${ProbeSlowAlarm.Arn}") OR
+        ALARM("${LockWaitAlarm.Arn}") OR ALARM("${AppErrorsAlarm.Arn}") OR
+        ALARM("${Alb5xxAlarm.Arn}") OR ALARM("${NoHealthyTargetAlarm.Arn}")
+      Tags:
+        - Key: Project
+          Value: openboxes-demo
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: temporary-demo
+        - Key: Owner
+          Value: AMHesch
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: DeleteAfter
+          Value: '2026-10-31'
+
   Dashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
@@ -483,7 +565,7 @@ Resources:
                   "height": 6,
                   "properties": {
                     "title": "OpenBoxes alarms",
-                    "alarms": ["${ProbeAlarmArn}", "${LockAlarmArn}", "${Alb5xxAlarmArn}", "${NoHealthyTargetAlarmArn}"],
+                    "alarms": ["${ProbeAlarmArn}", "${ProbeSlowAlarmArn}", "${LockAlarmArn}", "${AppErrorsAlarmArn}", "${Alb5xxAlarmArn}", "${NoHealthyTargetAlarmArn}", "${UserImpactAlarmArn}"],
                     "view": "timeSeries",
                     "region": "${AWS::Region}"
                   }
@@ -624,9 +706,12 @@ Resources:
               ]
             }
           - ProbeAlarmArn: !GetAtt ProbeAlarm.Arn
+            ProbeSlowAlarmArn: !GetAtt ProbeSlowAlarm.Arn
             LockAlarmArn: !GetAtt LockWaitAlarm.Arn
+            AppErrorsAlarmArn: !GetAtt AppErrorsAlarm.Arn
             Alb5xxAlarmArn: !GetAtt Alb5xxAlarm.Arn
             NoHealthyTargetAlarmArn: !GetAtt NoHealthyTargetAlarm.Arn
+            UserImpactAlarmArn: !GetAtt UserImpactAlarm.Arn
             AppLogGroup: /openboxes-demo/app
             DbInitLogGroup: /openboxes-demo/db-init
 
@@ -741,7 +826,7 @@ Resources:
         detail-type:
           - CloudWatch Alarm State Change
         resources:
-          - !GetAtt ProbeAlarm.Arn
+          - !GetAtt UserImpactAlarm.Arn
         detail:
           state:
             value:
@@ -796,6 +881,13 @@ Resources:
                   - cloudwatch:ListMetrics
                   - cloudwatch:GetDashboard
                   - cloudwatch:ListDashboards
+                Resource: '*'
+              - Sid: Ec2NetworkRead
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSecurityGroupRules
+                  - ec2:DescribeNetworkInterfaces
                 Resource: '*'
               - Sid: LogsDescribe
                 Effect: Allow
@@ -893,7 +985,7 @@ Outputs:
     Value: !GetAtt InvestigatorRole.Arn
   RoutedAlarmArn:
     Description: Alarm routed when webhook wiring is enabled
-    Value: !GetAtt ProbeAlarm.Arn
+    Value: !GetAtt UserImpactAlarm.Arn
   RuleArn:
     Condition: HasWebhook
     Description: EventBridge alarm-to-Devin rule ARN
