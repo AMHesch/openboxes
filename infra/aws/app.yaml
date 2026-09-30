@@ -248,7 +248,7 @@ Resources:
       HealthCheckProtocol: HTTP
       HealthCheckPath: /openboxes/health
       HealthCheckIntervalSeconds: 30
-      HealthCheckTimeoutSeconds: 5
+      HealthCheckTimeoutSeconds: 10
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 5
       Matcher:
